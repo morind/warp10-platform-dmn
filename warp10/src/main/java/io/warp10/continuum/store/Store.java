@@ -60,6 +60,10 @@ import kafka.consumer.KafkaStream;
 import kafka.javaapi.consumer.ConsumerConnector;
 import kafka.message.MessageAndMetadata;
 
+import kafka.javaapi.producer.Producer;
+import kafka.producer.KeyedMessage;
+import kafka.producer.ProducerConfig;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
@@ -78,6 +82,8 @@ import org.apache.hadoop.hbase.ipc.BlockingRpcCallback;
 import org.apache.hadoop.hbase.ipc.ServerRpcController;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.thrift.TDeserializer;
+import org.apache.thrift.TException;
+import org.apache.thrift.TSerializer;
 import org.apache.thrift.protocol.TCompactProtocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -199,7 +205,16 @@ public class Store extends Thread {
   
   private AtomicInteger inflightDeletions = new AtomicInteger(0);
   private AtomicInteger deletionErrors = new AtomicInteger(0);
-  
+
+  /**
+   * Pool of producers for the 'data' topic
+   */
+  private final Producer<byte[], byte[]>[] dataProducers;
+
+  //public static Producer<byte[],byte[]> producer;
+
+  public Properties deleteProps;
+
   public Store(KeyStore keystore, final Properties properties, Integer nthr) throws IOException {
     this.keystore = keystore;
     this.properties = properties;
@@ -209,7 +224,36 @@ public class Store extends Thread {
     } else {
       this.SKIP_WRITE = false;
     }
-    
+
+
+
+    Properties deleteProps = new Properties();
+    deleteProps.setProperty("metadata.broker.list", properties.getProperty(io.warp10.continuum.Configuration.STORE_KAFKA_DATA_BROKERLIST));
+    if (null != properties.getProperty(io.warp10.continuum.Configuration.STORE_KAFKA_DATA_PRODUCER_CLIENTID)) {
+      deleteProps.setProperty("client.id", properties.getProperty(io.warp10.continuum.Configuration.STORE_KAFKA_DATA_PRODUCER_CLIENTID));
+    }
+    deleteProps.setProperty("request.required.acks", "-1");
+    deleteProps.setProperty("producer.type","sync");
+    deleteProps.setProperty("serializer.class", "kafka.serializer.DefaultEncoder");
+    deleteProps.setProperty("partitioner.class", io.warp10.continuum.KafkaPartitioner.class.getName());
+
+
+    ProducerConfig deleteConfig = new ProducerConfig(deleteProps);
+
+    //producer = new Producer<byte[], byte[]>(deleteConfig);
+
+    //
+    // Allocate producer pool
+    //
+
+    this.dataProducers = new Producer[32];
+
+    for (int i = 0; i < dataProducers.length; i++) {
+      this.dataProducers[i] = new Producer<byte[], byte[]>(deleteConfig);
+    }
+
+    //
+
     //
     // Check mandatory parameters
     //
@@ -359,7 +403,7 @@ public class Store extends Thread {
                   throw new RuntimeException(t);
                 }
               }
-              consumers[idx] = new StoreConsumer(tables[idx], self, stream, counters);
+              consumers[idx] = new StoreConsumer(tables[idx], self, stream, counters, dataProducers);
               executor.submit(consumers[idx]);
               idx++;
             }      
@@ -636,13 +680,18 @@ public class Store extends Thread {
     final AtomicBoolean inflightMessage = new AtomicBoolean(false);
     final AtomicBoolean needToSync = new AtomicBoolean(false);
 
-    public StoreConsumer(Table table, Store store, KafkaStream<byte[], byte[]> stream, KafkaOffsetCounters counters) {
+    private Producer<byte[], byte[]>[] dataProducers = null;
+    private int dataProducersCurrentPoolSize = 0;
+
+    public StoreConsumer(Table table, Store store, KafkaStream<byte[], byte[]> stream, KafkaOffsetCounters counters, Producer<byte[], byte[]>[] dataProducers) {
       this.store = store;
       this.stream = stream;
       this.puts = new ArrayList<Put>();
       this.counters = counters;
       this.table = table;
       this.hbaseAESKey = store.keystore.getKey(KeyStore.AES_HBASE_DATA);
+      this.dataProducers = dataProducers;
+      this.dataProducersCurrentPoolSize = this.dataProducers.length;
     }
     
     private Thread getSynchronizer() {
@@ -1034,7 +1083,11 @@ public class Store extends Thread {
                 handleStore(ht, tmsg);              
                 break;
               case DELETE:
-                handleDelete(ht, tmsg);              
+                //handleDelete(ht, tmsg);
+
+                byte[] bytes = new byte[16];
+                GTSHelper.fillGTSIds(bytes, 0, tmsg.getClassId(), tmsg.getLabelsId());
+                handleDeleteToKafka(bytes, msg.message());
                 break;
               case ARCHIVE:
                 handleArchive(ht, tmsg);              
@@ -1180,7 +1233,82 @@ public class Store extends Thread {
       Sensision.update(SensisionConstants.SENSISION_CLASS_CONTINUUM_STORE_HBASE_PUTS, Sensision.EMPTY_LABELS, datapoints);
 
     }
-    
+
+    private void handleDeleteToKafka(byte[] bytes, byte[] msg) throws Throwable {
+        KeyedMessage<byte[], byte[]> message = new KeyedMessage<byte[], byte[]>("warp10.ovhpub-delete", bytes, msg);
+        Producer<byte[],byte[]> producer = getDataProducer();
+      try {
+        producer.send(message);
+      } catch (Throwable t) {
+        throw t;
+      } finally {
+        recycleDataProducer(producer);
+      }
+
+    }
+
+    private Producer<byte[],byte[]> getDataProducer() {
+
+      //
+      // We will count how long we wait for a producer
+      //
+
+      long nano = System.nanoTime();
+
+      Sensision.update(SensisionConstants.SENSISION_CLASS_CONTINUUM_INGRESS_KAFKA_DATA_PRODUCER_POOL_GET, Sensision.EMPTY_LABELS, 1);
+
+      while(true) {
+        synchronized (this.dataProducers) {
+          if (this.dataProducersCurrentPoolSize > 0) {
+            //
+            // hand out the producer at index 0
+            //
+
+            Producer<byte[],byte[]> producer = this.dataProducers[0];
+
+            //
+            // Decrement current pool size
+            //
+
+            this.dataProducersCurrentPoolSize--;
+
+            //
+            // Move the last element of the array at index 0
+            //
+
+            this.dataProducers[0] = this.dataProducers[this.dataProducersCurrentPoolSize];
+            this.dataProducers[this.dataProducersCurrentPoolSize] = null;
+
+            //
+            // Log waiting time
+            //
+
+            nano = System.nanoTime() - nano;
+            Sensision.update(SensisionConstants.SENSISION_CLASS_CONTINUUM_INGRESS_KAFKA_DATA_PRODUCER_WAIT_NANO, Sensision.EMPTY_LABELS, nano);
+
+            return producer;
+          }
+        }
+
+        LockSupport.parkNanos(500000L);
+      }
+    }
+
+    private void recycleDataProducer(Producer<byte[],byte[]> producer) {
+
+      if (this.dataProducersCurrentPoolSize == this.dataProducers.length) {
+        throw new RuntimeException("Invalid call to recycleProducer, pool already full!");
+      }
+
+      synchronized (this.dataProducers) {
+        //
+        // Add the recycled producer at the end of the pool
+        //
+
+        this.dataProducers[this.dataProducersCurrentPoolSize++] = producer;
+      }
+    }
+
     private void handleDelete(Table ht, final KafkaDataMessage msg) throws Throwable {
       
       if (KafkaDataMessageType.DELETE != msg.getType()) {
@@ -1447,6 +1575,7 @@ public class Store extends Thread {
       Preconditions.checkArgument(16 == key.length, "Key " + io.warp10.continuum.Configuration.STORE_KAFKA_DATA_MAC + " MUST be 128 bits long.");
       this.keystore.setKey(KeyStore.SIPHASH_KAFKA_DATA, key);
     }
+
 
     keyspec = props.getProperty(io.warp10.continuum.Configuration.STORE_KAFKA_DATA_AES);
     
